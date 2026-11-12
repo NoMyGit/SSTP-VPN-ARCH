@@ -37,7 +37,9 @@ PALETTES = {
 
 SETTINGS_PATH = Path(os.environ.get('XDG_CONFIG_HOME', str(Path.home() / '.config'))) / 'sstp-vpn' / 'appearance.json'
 LOCK_PATH = Path(os.environ.get('XDG_RUNTIME_DIR', '/tmp')) / f'sstp-vpn-{os.getuid()}.lock'
-VAULT_PATH = Path(__file__).resolve().with_name('connections.vault')
+DATA_DIR = Path(os.environ.get('XDG_DATA_HOME', str(Path.home() / '.local' / 'share'))) / 'sstp-vpn'
+VAULT_PATH = DATA_DIR / 'connections.vault'
+LEGACY_VAULT_PATH = Path(__file__).resolve().with_name('connections.vault')
 
 
 def contrast(first, second):
@@ -181,6 +183,16 @@ def run_nmcli(*args):
                           stderr=subprocess.PIPE)
 
 
+def run_worker(work, done):
+    def runner():
+        try:
+            value, error = work(), None
+        except Exception as exc:
+            value, error = None, exc
+        GLib.idle_add(done, value, error)
+    threading.Thread(target=runner, daemon=True).start()
+
+
 def profiles():
     result = run_nmcli('-t', '-f', 'NAME,UUID,TYPE', 'connection', 'show')
     if result.returncode:
@@ -253,6 +265,10 @@ class VPNApp:
     def unlock_vault(self):
         if self.vault is not None:
             return True
+        if not VAULT_PATH.exists() and LEGACY_VAULT_PATH.exists():
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(LEGACY_VAULT_PATH, VAULT_PATH)
+            os.chmod(VAULT_PATH, 0o600)
         first_run = not VAULT_PATH.exists()
         dialog = Gtk.Dialog(title='Защита подключений', transient_for=self.window, modal=True)
         dialog.add_buttons('Отмена', Gtk.ResponseType.CANCEL, 'Продолжить', Gtk.ResponseType.OK)
@@ -303,6 +319,7 @@ class VPNApp:
         return True
 
     def write_vault(self, salt=None):
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
         if salt is None:
             envelope = json.loads(VAULT_PATH.read_text())
             salt = base64.b64decode(envelope['salt'])
@@ -429,7 +446,10 @@ class VPNApp:
         self.status_label = self.label('', 'muted')
         self.status_label.set_selectable(True)
         panel.pack_start(self.status_label, False, False, 0)
-        panel.pack_start(self.button('Обновить состояние', self.refresh, 'tonal'), False, False, 0)
+        status_actions = Gtk.Box(spacing=10)
+        status_actions.pack_start(self.button('Обновить состояние', self.refresh, 'tonal'), False, False, 0)
+        status_actions.pack_start(self.button('Восстановить профили из vault', self.restore_profiles, 'primary'), False, False, 0)
+        panel.pack_start(status_actions, False, False, 0)
         status.pack_start(panel, False, False, 0)
         status.pack_start(self.label('Всегда под рукой', 'title'), False, False, 0)
         status.pack_start(self.label('Закройте окно, чтобы оставить приложение в трее. '
@@ -588,19 +608,26 @@ class VPNApp:
         self.indicator.set_menu(menu)
 
     def refresh(self, *_args):
+        if getattr(self, '_refreshing', False):
+            return
+        self._refreshing = True
         selected_row = self.listbox.get_selected_row()
         selected_uuid = selected_row.profile['uuid'] if selected_row else None
-        try:
-            self.items = profiles()
+        run_worker(profiles, lambda items, error: self.apply_refresh(items, error, selected_uuid))
+
+    def apply_refresh(self, items, error, selected_uuid):
+        self._refreshing = False
+        if error is None:
+            self.items = items
             active = [item['name'] for item in self.items if item['active']]
             self.hero_title.set_text('Вы подключены' if active else 'Готовы к подключению')
             self.hero_detail.set_text(' · '.join(active) if active else 'Выберите сохранённую сеть или создайте новую.')
             self.status_label.set_text(f'Сохранено подключений: {len(self.items)}\nАктивных: {len(active)}')
-        except Exception as exc:
+        else:
             self.items = []
             self.hero_title.set_text('Сеть недоступна')
             self.hero_detail.set_text('Не удалось связаться с NetworkManager.')
-            self.status_label.set_text('NetworkManager недоступен: ' + str(exc))
+            self.status_label.set_text('NetworkManager недоступен: ' + str(error))
         for child in self.listbox.get_children():
             self.listbox.remove(child)
         for item in self.items:
@@ -625,6 +652,68 @@ class VPNApp:
         self.listbox.show_all()
         self.on_row_selected(self.listbox, self.listbox.get_selected_row())
         self.rebuild_tray()
+        return False
+
+    def restore_profiles(self):
+        if not self.unlock_vault():
+            return
+        records = list(self.vault['profiles'].items())
+        if not records:
+            self.message('В зашифрованном хранилище нет профилей.', Gtk.MessageType.INFO)
+            return
+        self.status_label.set_text('Восстановление профилей из vault…')
+        run_worker(lambda: self.restore_worker(records), self.restore_finished)
+
+    def restore_worker(self, records):
+        existing = profiles()
+        by_name = {item['name']: item['uuid'] for item in existing}
+        mapping, failures = {}, []
+        for old_uuid, record in records:
+            name = record.get('name', '')
+            if not name or not record.get('gateway') or not record.get('user'):
+                failures.append(name or old_uuid)
+                continue
+            uuid = by_name.get(name)
+            if uuid is None:
+                created = run_nmcli('connection', 'add', 'type', 'vpn', 'vpn-type', 'sstp', 'ifname', '*', 'con-name', name)
+                if created.returncode:
+                    failures.append(name)
+                    continue
+                match = re.search(r'([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})', created.stdout, re.I)
+                if not match:
+                    failures.append(name)
+                    continue
+                uuid = match.group(1)
+                by_name[name] = uuid
+            saved = run_nmcli('connection', 'modify', 'uuid', uuid, 'vpn.data',
+                              f"gateway={record['gateway']},user={record['user']},password-flags=2,tls-ext=yes")
+            if saved.returncode:
+                failures.append(name)
+                continue
+            mapping[old_uuid] = uuid
+        return mapping, failures
+
+    def restore_finished(self, result, error):
+        if error is not None:
+            self.message('Не удалось восстановить профили: ' + str(error), Gtk.MessageType.ERROR)
+            return False
+        mapping, failures = result
+        if mapping:
+            restored = {}
+            for old_uuid, record in self.vault['profiles'].items():
+                restored[mapping.get(old_uuid, old_uuid)] = record
+            self.vault['profiles'] = restored
+            try:
+                self.write_vault()
+            except OSError as exc:
+                self.message('Профили созданы, но не удалось обновить vault: ' + str(exc), Gtk.MessageType.WARNING)
+        message = f'Восстановлено профилей: {len(mapping)}.'
+        if failures:
+            message += '\nНе восстановлены: ' + ', '.join(failures)
+        self.status_label.set_text(message)
+        self.message(message, Gtk.MessageType.INFO)
+        self.refresh()
+        return False
 
     def selected(self):
         row = self.listbox.get_selected_row()
@@ -719,7 +808,6 @@ class VPNApp:
         self.activate(item, not item['active'])
 
     def activate(self, item, enable):
-        action = 'up' if enable else 'down'
         if enable:
             if not self.unlock_vault():
                 return
@@ -727,28 +815,39 @@ class VPNApp:
             if not record:
                 self.message('Этот профиль ещё не перенесён в зашифрованное хранилище. Откройте «Изменить», введите пароль и сохраните.', Gtk.MessageType.WARNING)
                 return
-            fd, password_file = tempfile.mkstemp(prefix='.sstp-', dir=str(VAULT_PATH.parent))
-            try:
-                os.fchmod(fd, 0o600)
-                os.write(fd, ('vpn.secrets.password:' + record['password'] + '\n').encode())
-                os.close(fd)
-                result = run_nmcli('connection', action, 'uuid', item['uuid'], 'passwd-file', password_file)
-            finally:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-                try:
-                    os.unlink(password_file)
-                except OSError:
-                    pass
+            password = record['password']
         else:
-            result = run_nmcli('connection', action, 'uuid', item['uuid'])
-        if result.returncode:
+            password = None
+        self.status_label.set_text('Подключение выполняется…' if enable else 'Отключение выполняется…')
+        run_worker(lambda: self.activate_worker(item['uuid'], enable, password),
+                   lambda result, error: self.activate_finished(item, enable, result, error))
+
+    def activate_worker(self, uuid, enable, password):
+        if not enable:
+            return run_nmcli('connection', 'down', 'uuid', uuid)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        fd, password_file = tempfile.mkstemp(prefix='.sstp-', dir=str(DATA_DIR))
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                stream.write('vpn.secrets.password:' + password + '\n')
+                stream.flush()
+            return run_nmcli('connection', 'up', 'uuid', uuid, 'passwd-file', password_file)
+        finally:
+            try:
+                os.unlink(password_file)
+            except FileNotFoundError:
+                pass
+
+    def activate_finished(self, item, enable, result, error):
+        if error is not None:
+            self.message('Не удалось выполнить операцию: ' + str(error), Gtk.MessageType.ERROR)
+        elif result.returncode:
             self.error_from(result, f'Не удалось {"подключить" if enable else "отключить"} «{item["name"]}».')
         else:
             self.status_label.set_text(f'«{item["name"]}» {"подключён" if enable else "отключён"}.')
         self.refresh()
+        return False
 
     def delete_selected(self, *_args):
         item = self.selected()
@@ -762,16 +861,26 @@ class VPNApp:
         dialog.destroy()
         if response != Gtk.ResponseType.OK:
             return
-        if self.vault is not None and item['uuid'] in self.vault['profiles']:
-            del self.vault['profiles'][item['uuid']]
-            self.write_vault()
-        result = run_nmcli('connection', 'delete', 'uuid', item['uuid'])
-        if result.returncode:
+        self.status_label.set_text('Удаление профиля…')
+        run_worker(lambda: run_nmcli('connection', 'delete', 'uuid', item['uuid']),
+                   lambda result, error: self.delete_finished(item, result, error))
+
+    def delete_finished(self, item, result, error):
+        if error is not None:
+            self.message('Не удалось удалить профиль: ' + str(error), Gtk.MessageType.ERROR)
+        elif result.returncode:
             self.error_from(result, 'Не удалось удалить профиль.')
         else:
+            if self.vault is not None and item['uuid'] in self.vault['profiles']:
+                del self.vault['profiles'][item['uuid']]
+                try:
+                    self.write_vault()
+                except OSError as exc:
+                    self.message('Профиль удалён, но vault не обновлён: ' + str(exc), Gtk.MessageType.WARNING)
             self.new_profile()
             self.status_label.set_text(f'Профиль «{item["name"]}» удалён.')
         self.refresh()
+        return False
 
     def error_from(self, result, title):
         detail = (result.stderr or result.stdout).strip()

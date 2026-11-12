@@ -10,6 +10,9 @@ sudo pacman -S --needed networkmanager network-manager-sstp python python-crypto
 sudo systemctl enable --now NetworkManager
 mkdir -p "$APP_DEST_DIR" "$BIN_DEST_DIR" "$DESKTOP_DEST_DIR"
 install -m 755 "$APP_SOURCE_DIR/sstp_vpn_gui.py" "$APP_DEST_DIR/sstp_vpn_gui.py"
+if [[ -f "$APP_SOURCE_DIR/connections.vault" && ! -f "$APP_DEST_DIR/connections.vault" ]]; then
+  install -m 600 "$APP_SOURCE_DIR/connections.vault" "$APP_DEST_DIR/connections.vault"
+fi
 cat > "$BIN_DEST_DIR/sstp-vpn-gui" <<'LAUNCHER'
 #!/usr/bin/env bash
 exec /usr/bin/python3 "$HOME/.local/share/sstp-vpn/sstp_vpn_gui.py"
