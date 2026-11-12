@@ -807,17 +807,46 @@ class VPNApp:
     def toggle_profile(self, item):
         self.activate(item, not item['active'])
 
+    def request_sstp_password(self, name):
+        dialog = Gtk.Dialog(title='Пароль SSTP', transient_for=self.window, modal=True)
+        dialog.add_buttons('Отмена', Gtk.ResponseType.CANCEL, 'Подключить', Gtk.ResponseType.OK)
+        content = dialog.get_content_area()
+        content.set_spacing(10)
+        content.set_border_width(18)
+        content.pack_start(self.label(f'Введите пароль SSTP для «{name}». Он будет сохранён только в зашифрованном vault.', 'muted'), False, False, 0)
+        entry = Gtk.Entry()
+        entry.set_visibility(False)
+        entry.set_placeholder_text('Пароль SSTP')
+        entry.set_activates_default(True)
+        dialog.set_default_response(Gtk.ResponseType.OK)
+        content.pack_start(entry, False, False, 0)
+        dialog.show_all()
+        response = dialog.run()
+        password = entry.get_text()
+        dialog.destroy()
+        return password if response == Gtk.ResponseType.OK and password else None
+
     def activate(self, item, enable):
+        password = None
         if enable:
             if not self.unlock_vault():
                 return
             record = self.vault['profiles'].get(item['uuid'])
-            if not record:
-                self.message('Этот профиль ещё не перенесён в зашифрованное хранилище. Откройте «Изменить», введите пароль и сохраните.', Gtk.MessageType.WARNING)
-                return
-            password = record['password']
-        else:
-            password = None
+            if record:
+                password = record.get('password')
+            if not password:
+                password = self.request_sstp_password(item['name'])
+                if not password:
+                    return
+                self.vault['profiles'][item['uuid']] = {
+                    'name': item['name'], 'gateway': item['gateway'],
+                    'user': item['user'], 'password': password,
+                }
+                try:
+                    self.write_vault()
+                except OSError as exc:
+                    self.message('Не удалось записать зашифрованное хранилище: ' + str(exc), Gtk.MessageType.ERROR)
+                    return
         self.status_label.set_text('Подключение выполняется…' if enable else 'Отключение выполняется…')
         run_worker(lambda: self.activate_worker(item['uuid'], enable, password),
                    lambda result, error: self.activate_finished(item, enable, result, error))
@@ -825,6 +854,10 @@ class VPNApp:
     def activate_worker(self, uuid, enable, password):
         if not enable:
             return run_nmcli('connection', 'down', 'uuid', uuid)
+        # A legacy NetworkManager profile may still own its secret. Let it
+        # connect normally until the user saves the profile into the vault.
+        if password is None:
+            return run_nmcli('connection', 'up', 'uuid', uuid)
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         fd, password_file = tempfile.mkstemp(prefix='.sstp-', dir=str(DATA_DIR))
         try:
